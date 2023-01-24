@@ -1,7 +1,6 @@
 """
 Data generation functions for nonlinear relationships with random effects.
 """
-
 import sys
 import numpy as np
 import pandas as pd
@@ -19,8 +18,8 @@ from category_encoders.wrapper import NestedCVWrapper
 from pathlib import Path
 from tensorflow.random import set_seed
 from tensorflow.keras.callbacks import EarlyStopping
-from glmmnet import build_glmmnet, predict_glmmnet, build_baseline_nn
 sys.path.append("../")
+from glmmnet import build_glmmnet, predict_glmmnet, build_baseline_nn
 from utils import split, evaluate_model, evaluate_predictions, embedding_preproc
 
 def make_sim4(n_samples=100, noise=0.0, random_state=None):
@@ -498,8 +497,8 @@ if __name__ == '__main__':
     print(F.min(), F.max(), F.mean())
 
     X, F = make_friedman1(n_samples=1000, n_features=10, random_state=42)
-    stn = np.array([1, 1, 1e-6])
-    X, y, truth, Zu = make_sim(X, F, y_dist="lognormal", n_categories=100, signal_to_noise=stn, random_state=42)
+    stn = np.array([1, 1, 1e-3])
+    X, y, truth, Zu = make_sim(X, F, y_dist="lognormal", inverse_link=np.exp, n_categories=100, signal_to_noise=stn, random_state=42)
     # Check plot in an interactive environment
     # When stn[2] == 0, the plot should be a straight line
     _ = pd.DataFrame({"truth": truth, "y": y}).plot.scatter(x="truth", y = "y")
