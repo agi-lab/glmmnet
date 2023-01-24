@@ -8,6 +8,7 @@ import pandas as pd
 import statsmodels.api as sm
 import category_encoders as ce   # https://contrib.scikit-learn.org/category_encoders/
 import xgboost as xgb
+
 from sklearn.utils import check_random_state
 from sklearn.datasets import make_friedman1, make_friedman3
 from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
@@ -19,15 +20,8 @@ from pathlib import Path
 from tensorflow.random import set_seed
 from tensorflow.keras.callbacks import EarlyStopping
 from glmmnet import build_glmmnet, predict_glmmnet, build_baseline_nn
-
 sys.path.append("../")
-from utils import (
-    split,
-    evaluate_model, evaluate_predictions, 
-    plot_from_model, plot_from_predictions, plot_loss_curves, 
-    embedding_preproc,
-    plot_ridgeline
-)
+from utils import split, evaluate_model, evaluate_predictions, embedding_preproc
 
 def make_sim4(n_samples=100, noise=0.0, random_state=None):
     """Generate synthetic regression data.
