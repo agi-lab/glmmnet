@@ -43,3 +43,6 @@ vignettes/*.pdf
 
 # OS generated files
 .DS_Store
+
+# ipynb checkpoints
+*.ipynb_checkpoints/
