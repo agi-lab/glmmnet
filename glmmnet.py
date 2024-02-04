@@ -1,8 +1,9 @@
-import tqdm
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 from tensorflow.keras import layers, models
+from scipy.linalg import block_diag
+from tqdm import tqdm
 
 tfd = tfp.distributions
 
@@ -194,7 +195,7 @@ def predict_glmmnet(glmmnet, data, hicard_var, n_prediction_samples = 100):
     """
     y_pred = np.zeros((data.shape[0], n_prediction_samples))
     hicard_columns = data.columns[data.columns.str.startswith(hicard_var)]
-    for i in tqdm.tqdm(range(n_prediction_samples)):
+    for i in tqdm(range(n_prediction_samples)):
         y_pred[:, i] = glmmnet((
             tf.convert_to_tensor(data.drop(hicard_columns, axis=1)), 
             tf.convert_to_tensor(data[hicard_columns])), training=False).mean().numpy().flatten()
@@ -253,3 +254,146 @@ def build_baseline_nn(X_train, objective="mse", print_embeddings=False, random_s
     model.compile(optimizer="adam", loss=objective, metrics=["mae"])
 
     return model
+
+def _get_block_cov_matrix(block_sizes, cov_pars):
+    """
+    Creates lower-triangular matrix for block diagonal covariance matrix. covariance = scale_tril * scale_tril^T
+
+    Parameters
+    ----------
+    block_sizes: list of sizes of adjacent dependent blocks
+    cov_pars: tensor containing inputs for lower triangular matrix for block diagonal covariance matrix
+    """
+    tril_indices = None  # Initialize tril_indices
+
+    start = 0
+    offset = [0, 0]
+    for i in range(len(block_sizes)):
+        size = block_sizes[i]
+        end = start + size * (size + 1) // 2
+        indices = tf.where(tf.linalg.band_part(tf.ones((size, size)), -1, 0)) + offset
+        if tril_indices is None:
+            tril_indices = indices
+        else:
+            tril_indices = tf.concat([tril_indices, indices], axis=0)
+        offset = [size + j for j in offset]
+        start = end
+    # reshaped_tensors = [tf.reshape(t, (-1, 2)) for t in tril_indices]
+    # concatenated = tf.concat(reshaped_tensors, axis=0)
+        
+    # The size of tril_indices is sum of n * (n + 1) / 2 for n in block_sizes
+    # Check if the size of tril_indices is equal to the size of cov_pars
+    assert len(tril_indices) == len(cov_pars), "The size of cov_pars does not match up with the size of the lower triangular matrix specified."
+
+    block_matrix = tf.scatter_nd(
+        indices=tril_indices,
+        updates=cov_pars,
+        shape=(sum(block_sizes), sum(block_sizes))
+    )
+    return block_matrix
+
+def build_glmmnet_dependent(cardinality, num_vars, final_layer_likelihood, train_size, block_sizes, random_state=42, regularizer=False, is_prior_trainable=False):
+    """
+    Build a GLMMNet model allowing for posterior correlation.
+
+    Parameters
+    ----------
+    cardinality: int, number of unique values in the high-cardinality variable of interest
+    num_vars: list of numerical variables
+    final_layer_likelihood: str, likelihood of the final layer, "gaussian" or "gamma"
+    train_size: int, number of training samples (used in kl_weight)
+    block_sizes: list of sizes of adjacent dependent blocks
+    random_state: int, random seed
+    regularizer: bool, whether to use l2 regulariser, default is False
+    is_prior_trainable: bool, whether to train the prior parameters, default is False
+    """
+    # Set random seed
+    tf.random.set_seed(random_state)
+
+    # Construct a standard FFNN for the fixed effects
+    num_inputs = layers.Input(shape=(len(num_vars),), name="numeric_inputs")
+    hidden_units = [64, 32, 16]
+    hidden_activation = "relu"
+    x = num_inputs
+    for hidden_layer in range(len(hidden_units)):
+        units = hidden_units[hidden_layer]
+        x = layers.Dense(
+            units=units, activation=hidden_activation, 
+            kernel_regularizer=tf.keras.regularizers.l2(0.01) if regularizer else None,
+            name=f"hidden_{hidden_layer + 1}")(x)
+    f_X = layers.Dense(units=1, activation="linear", name="f_X")(x)
+
+    # Deal with categorical inputs (random effects)
+    cat_inputs = layers.Input(shape=(cardinality,), name=f"category_OHE_inputs")
+    
+    # Specify the surrogate posterior over the random effects
+    def posterior_u(kernel_size, bias_size=0, dtype=None):
+        n = kernel_size + bias_size # Size of categorical variable
+        num_cov_pars = int(sum([size*(size+1)/2 for size in block_sizes]))
+
+        return tf.keras.Sequential([
+            tfp.layers.VariableLayer(n + num_cov_pars, dtype=dtype, initializer="random_normal"), #[:n] outputs get passed to loc parameters. [n:] outputs get passed as cov parameters 
+            tfp.layers.DistributionLambda(lambda t: tfd.MultivariateNormalTriL(
+                    loc = t[..., :n], 
+                    scale_tril = 0.01 * _get_block_cov_matrix(block_sizes, t[...,n:]) #tf.convert_to_tensor(_get_block_cov_matrix(block_sizes, t[...,n:]), dtype = dtype)
+            ))
+        ])
+    
+    # Specify the prior over the random effects
+    def prior_trainable(kernel_size, bias_size=0, dtype=None):
+        n = kernel_size + bias_size
+        c = np.log(np.expm1(0.1)) # Inverse of softplus()
+        return tf.keras.Sequential([
+            tfp.layers.VariableLayer(1, dtype=dtype, initializer="random_normal"),
+            tfp.layers.DistributionLambda(lambda t: tfd.Independent(
+                tfd.Normal(loc=tf.zeros(n), scale=tf.nn.softplus(c + t)),
+                reinterpreted_batch_ndims=1)),
+        ])
+    def prior_fixed(kernel_size, bias_size=0, dtype=None):
+        n = kernel_size + bias_size
+        return lambda t: tfd.Independent(
+            tfd.Normal(loc=tf.zeros(n), scale=0.1 * tf.ones(n)), 
+            reinterpreted_batch_ndims=1
+        )
+    # Construct the random effects, by variational inference
+    RE = tfp.layers.DenseVariational(
+        units=1, 
+        make_posterior_fn=posterior_u,
+        make_prior_fn=prior_trainable if is_prior_trainable else prior_fixed,
+        kl_weight=1 / train_size,
+        use_bias=False,
+        activity_regularizer=tf.keras.regularizers.l2(0.01) if regularizer else None,
+        name="RE",)(cat_inputs)
+
+    # Add the RE to the f(X) output
+    eta = layers.Add(name="f_X_plus_RE")([f_X, RE])
+
+    # Build the final layer
+    if final_layer_likelihood == "gaussian":
+        # Compute the distributional parameters
+        dist_params = DistParams(inverse_link="identity", phi_init=0.1, name="dist_params",)(eta)
+        # Construct the distribution output
+        output = tfp.layers.DistributionLambda(
+            lambda t: tfd.Normal(loc=t[..., :1], scale=t[..., 1:]), 
+            name="distribution",
+        )(dist_params)
+    elif final_layer_likelihood == "gamma":
+        # Compute the distributional parameters
+        dist_params = DistParams(
+            inverse_link="exp",
+            phi_init=0.1,
+            name="dist_params",)(eta)
+        # Construct the distribution output
+        output = tfp.layers.DistributionLambda(
+            lambda t: tfd.Gamma(                    # https://www.tensorflow.org/probability/api_docs/python/tfp/distributions/Gamma
+                concentration=1 / t[..., 1:],       # concentration = shape = 1 / dispersion
+                rate=(1 / t[..., 1:]) / t[..., :1], # rate = shape / location
+            ), name="distribution")(dist_params)
+    
+    glmmnet = models.Model(inputs=[num_inputs, cat_inputs], outputs=output)
+
+    def NLL(y_true, y_dist_pred):
+        return -y_dist_pred.log_prob(y_true)
+    glmmnet.compile(optimizer="adam", loss=NLL)
+
+    return glmmnet
